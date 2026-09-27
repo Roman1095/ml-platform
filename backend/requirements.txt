@@ -1,7 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn[standard]==0.53.0
 
-sqlalchemy
+SQLAlchemy[asyncio]
+greenlet
 asyncpg
 alembic
 
@@ -13,7 +14,7 @@ PyJWT[crypto]
 numpy
 scipy
 pandas
-scikit-learn
+scikit-learn==1.7.2
 
 joblib
 onnx
