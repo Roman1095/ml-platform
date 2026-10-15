@@ -72,6 +72,9 @@ services:
     env_file:
       - .env
 
+    environment:
+      WORKER_NAME: ml-platform-worker-1
+
     depends_on:
       db:
         condition: service_healthy

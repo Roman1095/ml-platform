@@ -4,11 +4,17 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user
 from app.db.session import get_db
+from app.services.artifacts import (
+    artifact_download_filename,
+    resolve_stored_artifact_path,
+    sha256_file,
+)
 from app.models.artifact import ModelArtifact
 from app.models.dataset import Dataset, DatasetVersion
 from app.models.job import TrainingJob, TrainingLog, TrainingMetric
@@ -316,7 +322,6 @@ async def get_job_artifacts(
             name=artifact.name,
             version=artifact.version,
             format=artifact.format,
-            storage_uri=artifact.storage_uri,
             checksum_sha256=artifact.checksum_sha256,
             size_bytes=artifact.size_bytes,
             metrics=artifact.metrics_,
@@ -325,6 +330,61 @@ async def get_job_artifacts(
         )
         for artifact in result.scalars().all()
     ]
+
+
+@router.get(
+    "/{job_id}/artifacts/{artifact_id}/download",
+)
+async def download_job_artifact(
+    job_id: uuid.UUID,
+    artifact_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(ModelArtifact).where(
+            ModelArtifact.id == artifact_id,
+            ModelArtifact.job_id == job_id,
+            ModelArtifact.owner_user_id == current_user.id,
+        )
+    )
+
+    artifact = result.scalar_one_or_none()
+
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact not found",
+        )
+
+    path = resolve_stored_artifact_path(artifact.storage_uri)
+
+    if path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file not found",
+        )
+
+    if artifact.checksum_sha256 is not None:
+        actual_checksum = sha256_file(path)
+
+        if actual_checksum != artifact.checksum_sha256:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Artifact checksum mismatch",
+            )
+
+    filename = artifact_download_filename(
+        artifact.job_id,
+        artifact.format,
+    )
+
+    return FileResponse(
+        path=path,
+        media_type="application/octet-stream",
+        filename=filename,
+        content_disposition_type="attachment",
+    )
 
 
 @router.post(

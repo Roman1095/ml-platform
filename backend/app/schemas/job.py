@@ -58,6 +58,8 @@ class TrainingJobResponse(BaseModel):
     error_code: str | None
     error_message: str | None
 
+    worker_node_id: uuid.UUID | None = None
+
     queued_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -92,7 +94,6 @@ class ModelArtifactResponse(BaseModel):
     name: str
     version: int
     format: OutputFormat
-    storage_uri: str
     checksum_sha256: str | None
     size_bytes: int | None
     metrics: dict

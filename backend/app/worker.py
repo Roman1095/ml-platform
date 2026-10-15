@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
+import platform
+import socket
+import sys
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,12 +38,14 @@ from sklearn.svm import SVC
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.artifact import ModelArtifact
 from app.models.dataset import Dataset, DatasetVersion
 from app.models.job import TrainingJob, TrainingLog, TrainingMetric
 from app.models.template import TrainingTemplateVersion
 from app.models.worker import WorkerNode
+from app.services.artifacts import sha256_file
 from app.services.job_lifecycle import JobStateError, transition_or_raise
 
 
@@ -51,18 +56,27 @@ logging.basicConfig(
 
 logger = logging.getLogger("ml-platform-worker")
 
-
-ARTIFACT_ROOT = Path(
-    os.getenv("ARTIFACT_ROOT", "/data/models")
-)
-
-POLL_INTERVAL = float(
-    os.getenv("WORKER_POLL_INTERVAL", "2")
-)
+WORKER_CAPABILITIES = {
+    "frameworks": ["sklearn"],
+    "output_formats": ["joblib"],
+}
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def read_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemTotal:"):
+                    kilobytes = int(line.split()[1])
+                    return kilobytes * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+
+    return None
 
 
 def load_builtin_dataset(name: str):
@@ -155,6 +169,12 @@ def create_regression_model(
     )
 
 
+def export_joblib_artifact(model, path: Path) -> tuple[int, str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, path)
+    return path.stat().st_size, sha256_file(path)
+
+
 async def write_log(
     db: AsyncSession,
     job_id: uuid.UUID,
@@ -184,7 +204,8 @@ async def write_metric(
 ):
     db.add(
         TrainingMetric(
-            job_id=job_id,epoch=epoch,
+            job_id=job_id,
+            epoch=epoch,
             step=step,
             metric_name=name,
             metric_value=float(value),
@@ -194,8 +215,136 @@ async def write_metric(
     await db.flush()
 
 
-async def claim_job():
+async def register_worker() -> uuid.UUID:
+    cpu_cores = os.cpu_count()
+    memory_bytes = read_memory_bytes()
+    now = utcnow()
+
     async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(WorkerNode).where(
+                WorkerNode.name == settings.worker_name
+            )
+        )
+
+        node = result.scalar_one_or_none()
+
+        if node is None:
+            node = WorkerNode(
+                name=settings.worker_name,
+                hostname=socket.gethostname(),
+                platform=sys.platform,
+                architecture=platform.machine() or None,
+                cpu_cores=cpu_cores if cpu_cores and cpu_cores > 0 else None,
+                memory_bytes=memory_bytes,
+                status="online",
+                capabilities=WORKER_CAPABILITIES,
+                last_heartbeat_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(node)
+        else:
+            node.hostname = socket.gethostname()
+            node.platform = sys.platform
+            node.architecture = platform.machine() or None
+            node.cpu_cores = (
+                cpu_cores if cpu_cores and cpu_cores > 0 else None
+            )
+            node.memory_bytes = memory_bytes
+            node.status = "online"
+            node.capabilities = WORKER_CAPABILITIES
+            node.last_heartbeat_at = now
+            node.updated_at = now
+
+        await db.commit()
+        await db.refresh(node)
+
+        logger.info(
+            "Registered worker node %s (%s)",
+            node.id,
+            settings.worker_name,
+        )
+
+        return node.id
+
+
+async def heartbeat_loop(worker_id: uuid.UUID):
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(WorkerNode)
+                    .where(WorkerNode.id == worker_id)
+                    .with_for_update()
+                )
+                node = result.scalar_one_or_none()
+
+                if node is not None:
+                    node.last_heartbeat_at = utcnow()
+                    node.updated_at = utcnow()
+
+                    if node.status == "offline":
+                        node.status = "online"
+
+                    await db.commit()
+        except Exception:
+            logger.exception("Worker heartbeat failed")
+
+        await asyncio.sleep(settings.worker_heartbeat_interval)
+
+
+async def set_worker_idle(worker_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(WorkerNode)
+            .where(WorkerNode.id == worker_id)
+            .with_for_update()
+        )
+        node = result.scalar_one_or_none()
+
+        if node is None:
+            await db.rollback()
+            return
+
+        if node.status == "busy":
+            node.status = "online"
+            node.updated_at = utcnow()
+
+        await db.commit()
+
+
+async def set_worker_offline(worker_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(WorkerNode)
+            .where(WorkerNode.id == worker_id)
+            .with_for_update()
+        )
+        node = result.scalar_one_or_none()
+
+        if node is None:
+            await db.rollback()
+            return
+
+        node.status = "offline"
+        node.updated_at = utcnow()
+        await db.commit()
+
+
+async def claim_job(worker_id: uuid.UUID):
+    async with AsyncSessionLocal() as db:
+        worker_result = await db.execute(
+            select(WorkerNode)
+            .where(WorkerNode.id == worker_id)
+            .with_for_update()
+        )
+        worker = worker_result.scalar_one_or_none()
+
+        if worker is None or worker.status == "maintenance":
+            await db.rollback()
+            return None
+
         result = await db.execute(
             select(TrainingJob)
             .where(TrainingJob.status == "queued")
@@ -216,9 +365,14 @@ async def claim_job():
 
         transition_or_raise(job.status, "preparing")
         job.status = "preparing"
+        job.worker_node_id = worker_id
         job.started_at = utcnow()
         job.progress_percent = 5
         job.updated_at = utcnow()
+
+        worker.status = "busy"
+        worker.last_heartbeat_at = utcnow()
+        worker.updated_at = utcnow()
 
         await db.commit()
 
@@ -263,10 +417,6 @@ async def run_job(job_id: uuid.UUID):
         job = result.scalar_one()
 
         try:
-            # -------------------------------------------------
-            # Template
-            # -------------------------------------------------
-
             template_result = await db.execute(
                 select(TrainingTemplateVersion).where(
                     TrainingTemplateVersion.id
@@ -277,10 +427,6 @@ async def run_job(job_id: uuid.UUID):
             template_version = (
                 template_result.scalar_one()
             )
-
-            # -------------------------------------------------
-            # Dataset
-            # -------------------------------------------------
 
             dataset_version_result = await db.execute(
                 select(DatasetVersion).where(
@@ -315,10 +461,6 @@ async def run_job(job_id: uuid.UUID):
 
             if not await ensure_not_cancelled(db, job.id):
                 return
-
-            # -------------------------------------------------
-            # Сейчас worker работает только с sklearn builtin
-            # -------------------------------------------------
 
             if dataset.framework != "sklearn":
                 raise ValueError(
@@ -363,9 +505,6 @@ async def run_job(job_id: uuid.UUID):
                 params.get("model", "random_forest")
             )
 
-            # -------------------------------------------------
-            # RUNNING# -------------------------------------------------
-
             transition_or_raise(job.status, "running")
             job.status = "running"
             job.progress_percent = 20
@@ -382,10 +521,6 @@ async def run_job(job_id: uuid.UUID):
             )
 
             await db.commit()
-
-            # -------------------------------------------------
-            # split
-            # -------------------------------------------------
 
             stratify = y if "classification" in template_version.entrypoint else None
 
@@ -427,11 +562,8 @@ async def run_job(job_id: uuid.UUID):
             if not await ensure_not_cancelled(db, job.id):
                 return
 
-            # -------------------------------------------------
-            # actual training
-            # -------------------------------------------------
-
-            model.fit(
+            await asyncio.to_thread(
+                model.fit,
                 X_train,
                 y_train,
             )
@@ -450,10 +582,6 @@ async def run_job(job_id: uuid.UUID):
             if not await ensure_not_cancelled(db, job.id):
                 return
 
-            # -------------------------------------------------
-            # evaluate
-            # -------------------------------------------------
-
             transition_or_raise(job.status, "evaluating")
             job.status = "evaluating"
             job.progress_percent = 80
@@ -467,7 +595,10 @@ async def run_job(job_id: uuid.UUID):
 
             await db.commit()
 
-            predictions = model.predict(X_test)
+            predictions = await asyncio.to_thread(
+                model.predict,
+                X_test,
+            )
 
             metrics = {}
 
@@ -527,10 +658,6 @@ async def run_job(job_id: uuid.UUID):
             if not await ensure_not_cancelled(db, job.id):
                 return
 
-            # -------------------------------------------------
-            # export
-            # -------------------------------------------------
-
             transition_or_raise(job.status, "exporting")
             job.status = "exporting"
             job.updated_at = utcnow()
@@ -543,37 +670,15 @@ async def run_job(job_id: uuid.UUID):
 
             await db.commit()
 
-            ARTIFACT_ROOT.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            artifact_root = settings.artifact_root
+            artifact_path = artifact_root / f"{job.id}.joblib"
 
-            artifact_path = (
-                ARTIFACT_ROOT
-                / f"{job.id}.joblib"
-            )
-
-            joblib.dump(
+            size_bytes, checksum = await asyncio.to_thread(
+                export_joblib_artifact,
                 model,
                 artifact_path,
             )
 
-            size_bytes = artifact_path.stat().st_size
-
-            sha256 = hashlib.sha256()
-
-            with artifact_path.open("rb") as file:
-                for chunk in iter(
-                    lambda: file.read(1024 * 1024),
-                    b"",
-                ):
-                    sha256.update(chunk)
-
-            checksum = sha256.hexdigest()
-
-            # Re-read and lock the job before creating the DB artifact
-            # and marking it completed. This is the final race-protection
-            # point against POST /cancel.
             final_result = await db.execute(
                 select(TrainingJob)
                 .where(TrainingJob.id == job.id)
@@ -609,9 +714,7 @@ async def run_job(job_id: uuid.UUID):
                 ),
                 version=1,
                 format="joblib",
-                storage_uri=str(
-                    artifact_path
-                ),
+                storage_uri=str(artifact_path.resolve()),
                 checksum_sha256=checksum,
                 size_bytes=size_bytes,
                 metrics_=metrics,
@@ -624,10 +727,6 @@ async def run_job(job_id: uuid.UUID):
             )
 
             db.add(artifact)
-
-            # -------------------------------------------------
-            # completed
-            # -------------------------------------------------
 
             final_job.status = "completed"
             final_job.progress_percent = 100
@@ -680,7 +779,6 @@ async def run_job(job_id: uuid.UUID):
                     "failed",
                 )
             except JobStateError:
-                # Do not overwrite an already-terminal state.
                 await db.rollback()
                 return
 
@@ -703,14 +801,12 @@ async def run_job(job_id: uuid.UUID):
             await db.commit()
 
 
-async def worker_loop():
-    logger.info(
-        "ML worker started"
-    )
+async def worker_loop(worker_id: uuid.UUID):
+    logger.info("ML worker started")
 
     while True:
         try:
-            job_id = await claim_job()
+            job_id = await claim_job(worker_id)
 
             if job_id is not None:
                 logger.info(
@@ -718,11 +814,14 @@ async def worker_loop():
                     job_id,
                 )
 
-                await run_job(job_id)
+                try:
+                    await run_job(job_id)
+                finally:
+                    await set_worker_idle(worker_id)
 
             else:
                 await asyncio.sleep(
-                    POLL_INTERVAL
+                    settings.worker_poll_interval
                 )
 
         except Exception:
@@ -730,11 +829,27 @@ async def worker_loop():
                 "Worker loop error"
             )
             await asyncio.sleep(
-                POLL_INTERVAL
+                settings.worker_poll_interval
             )
 
 
-if __name__ == "__main__":
-    asyncio.run(
-        worker_loop()
+async def main():
+    worker_id = await register_worker()
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(worker_id)
     )
+
+    try:
+        await worker_loop(worker_id)
+    finally:
+        heartbeat_task.cancel()
+
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+        await set_worker_offline(worker_id)
+        logger.info("Worker node marked offline")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

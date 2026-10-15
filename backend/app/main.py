@@ -14,9 +14,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-
-# app.include_router(auth_router)
-# app.include_router(users_router)
 app.include_router(jobs_router)
 app.include_router(auth_router)
 app.include_router(users_router)
